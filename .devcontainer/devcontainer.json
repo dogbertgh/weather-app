@@ -2,8 +2,8 @@
   "name": "Claude Code Environment",
   "image": "mcr.microsoft.com/devcontainers/python:3.12",
   "features": {
-    "ghcr.io/devcontainers/features/node:1": {
-      "version": "22"
+    "ghcr.io/devcontainers/features/node:2.1.1": {
+      "version": "24"
     }
   },
   "postCreateCommand": "npm install -g @anthropic-ai/claude-code",
