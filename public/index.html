@@ -29,6 +29,19 @@
     .bar span { position: absolute; left: 0; right: 0; border-radius: 4px; background: linear-gradient(#ff7043, #ffd54f, #4fc3f7); }
     .hi { font-weight: 700; } .lo { opacity: .75; }
     .precip { font-size: .8rem; opacity: .85; }
+    .hourly { position: relative; margin-top: 2rem; width: 100%; max-width: 760px; background: rgba(255,255,255,.15); border-radius: 12px; padding: .8rem; }
+    .hourly-title { font-weight: 600; margin-bottom: .3rem; }
+    .hourly svg { display: block; width: 100%; outline: none; touch-action: pan-y; }
+    .hourly svg:focus-visible { outline: 2px solid #ffd54f; outline-offset: 2px; border-radius: 4px; }
+    .hourly svg text { fill: #fff; font-family: inherit; }
+    .hourly .muted { fill-opacity: .75; font-size: 11px; font-variant-numeric: tabular-nums; }
+    .tooltip { position: absolute; pointer-events: none; background: #fff; color: #1e3c72; border-radius: 8px; padding: .4rem .6rem; font-size: .85rem; box-shadow: 0 2px 8px rgba(0,0,0,.25); white-space: nowrap; }
+    .tooltip strong { display: block; font-size: 1.1rem; }
+    .tooltip .sub { opacity: .75; }
+    .hourly-table { margin-top: .5rem; font-size: .85rem; }
+    .hourly-table summary { cursor: pointer; opacity: .85; }
+    .hourly-table table { width: 100%; border-collapse: collapse; margin-top: .4rem; font-variant-numeric: tabular-nums; }
+    .hourly-table th, .hourly-table td { text-align: left; padding: .2rem .4rem; border-bottom: 1px solid rgba(255,255,255,.15); }
     #status { opacity: .85; }
     .alerts { width: 100%; max-width: 760px; margin-top: 2rem; }
     .alert { border-radius: 12px; margin-bottom: .6rem; background: #616161; color: #fff; }
@@ -62,6 +75,18 @@
     <div class="place" id="cur-place"></div>
   </div>
   <div class="forecast" id="forecast"></div>
+  <section class="hourly" id="hourly" hidden>
+    <div class="hourly-title">Next 24 hours</div>
+    <div id="hourly-chart"></div>
+    <div class="tooltip" id="hourly-tip" hidden></div>
+    <details class="hourly-table">
+      <summary>Show as table</summary>
+      <table>
+        <thead><tr><th>Time</th><th>Conditions</th><th>Temp</th><th>Rain</th></tr></thead>
+        <tbody id="hourly-rows"></tbody>
+      </table>
+    </details>
+  </section>
   <div class="alerts" id="alerts" aria-live="polite"></div>
 
   <script>
@@ -79,6 +104,9 @@
       95: ['⛈️', 'Thunderstorm'], 96: ['⛈️', 'Thunderstorm w/ hail'], 99: ['⛈️', 'Thunderstorm w/ hail'],
     };
     const weather = code => CODES[code] || ['🌡️', 'Unknown'];
+    // At night, swap sun icons: moon for clear/mainly clear, plain cloud for partly cloudy.
+    const NIGHT_ICONS = { 0: '🌙', 1: '🌙', 2: '☁️' };
+    const weatherAt = (code, isDay) => !isDay && NIGHT_ICONS[code] ? [NIGHT_ICONS[code], CODES[code][1]] : weather(code);
     const $ = id => document.getElementById(id);
 
     // Data is always fetched in Fahrenheit and converted for display, so toggling needs no refetch.
@@ -102,10 +130,11 @@
 
     // Auto-refresh intervals. Alerts change quickly; the forecast doesn't.
     const ALERTS_EVERY = 2 * 60 * 1000, FORECAST_EVERY = 15 * 60 * 1000;
-    let loc = null, forecastAt = 0, alertsAt = 0;
+    let loc = null, forecastAt = 0, alertsAt = 0, lastAlerts = null;
 
     function loadWeather(lat, lon, placeName) {
       loc = { lat, lon, place: placeName };
+      lastAlerts = null;
       $('alerts').innerHTML = '';
       $('status').textContent = 'Loading weather…';
       refreshForecast();
@@ -117,15 +146,19 @@
       forecastAt = Date.now();
       const url = `https://api.open-meteo.com/v1/forecast?latitude=${target.lat}&longitude=${target.lon}` +
         `&current=temperature_2m,weather_code&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max` +
-        `&temperature_unit=fahrenheit&timezone=auto&forecast_days=7`;
+        `&hourly=temperature_2m,weather_code,precipitation_probability,is_day` +
+        `&temperature_unit=fahrenheit&timezone=auto&forecast_days=7&forecast_hours=24`;
       try {
         const data = await (await fetch(url)).json();
         if (target !== loc) return; // user switched locations mid-request
         lastData = data;
         lastPlace = target.place;
+        const tzChanged = target.tz !== data.timezone;
         target.tz = data.timezone;
         $('status').textContent = '';
         render();
+        // Alerts may have rendered before the timezone was known; redraw them in local time.
+        if (tzChanged && lastAlerts) renderAlerts(lastAlerts);
       } catch (e) {
         // On a background refresh, keep showing the last good data.
         if (target === loc && !lastData) $('status').textContent = 'Could not load weather. Please try again.';
@@ -150,7 +183,8 @@
         if (target !== loc) return;
         if (res.status === 400) { $('alerts').innerHTML = ''; return; } // outside NWS coverage
         if (!res.ok) throw new Error(`NWS ${res.status}`);
-        renderAlerts((await res.json()).features.map(f => f.properties));
+        lastAlerts = (await res.json()).features.map(f => f.properties);
+        renderAlerts(lastAlerts);
       } catch (e) {
         // Keep whatever alerts are already shown rather than blanking them on a transient error.
         console.warn('Could not load NWS alerts', e);
@@ -194,7 +228,150 @@
       $('cur-place').textContent = lastPlace;
       $('current').hidden = false;
       renderForecast(lastData.daily);
+      renderHourly(lastData.hourly);
     }
+
+    // Hourly times are already in the location's local time (timezone=auto), e.g. "2026-10-15T13:00".
+    const weekday = t => new Date(t.slice(0, 10) + 'T12:00').toLocaleDateString('en-US', { weekday: 'short' });
+    const hourText = t => { const hr = Number(t.slice(11, 13)); return `${hr % 12 || 12} ${hr < 12 ? 'AM' : 'PM'}`; };
+    // Axis labels mark midnight with the weekday so the day boundary is visible.
+    const axisLabel = t => t.slice(11, 13) === '00' ? weekday(t) : hourText(t);
+
+    // 24-hour chart: temperature line on top, chance-of-rain columns below. Two panels, each with its own scale,
+    // sharing the time axis (never two y-scales on one plot).
+    const SVG_NS = 'http://www.w3.org/2000/svg';
+    const SURFACE = '#4b6ea2', RAIN = '#81d4fa'; // approx. card color over the page gradient; rain column color
+    function svgEl(tag, attrs, text) {
+      const el = document.createElementNS(SVG_NS, tag);
+      for (const k in attrs) el.setAttribute(k, attrs[k]);
+      if (text != null) el.textContent = text;
+      return el;
+    }
+
+    function renderHourly(h) {
+      $('hourly').hidden = false;
+      const box = $('hourly-chart');
+      const W = Math.max(box.clientWidth, 300);
+      const padL = 36, padR = 8;
+      const timeH = 16, iconsH = 28, plotTop = timeH + iconsH + 22, plotH = 120;
+      const rainTop = plotTop + plotH + 34, rainH = 40, rainBottom = rainTop + rainH;
+      const H = rainBottom + 4;
+      const n = h.time.length, step = (W - padL - padR) / n;
+      const x = i => padL + (i + .5) * step;
+
+      const temps = h.temperature_2m.map(toUnit), rain = h.precipitation_probability.map(p => p ?? 0);
+      const min = Math.min(...temps), max = Math.max(...temps);
+      const tick = max - min > 20 ? 10 : 5;
+      const lo = Math.floor(min / tick) * tick, hi = Math.max(Math.ceil(max / tick) * tick, lo + tick);
+      const y = v => plotTop + plotH - ((v - lo) / (hi - lo)) * plotH;
+
+      const svg = svgEl('svg', { width: W, height: H, viewBox: `0 0 ${W} ${H}`, tabindex: 0, role: 'img',
+        'aria-label': `Hourly temperature from ${Math.round(min)}° to ${Math.round(max)}°${unit}; use arrow keys to step through hours` });
+
+      // Gridlines + y ticks for temperature.
+      for (let v = lo; v <= hi; v += tick) {
+        svg.append(svgEl('line', { x1: padL, x2: W - padR, y1: y(v), y2: y(v), stroke: '#fff', 'stroke-opacity': .15 }));
+        svg.append(svgEl('text', { x: padL - 6, y: y(v) + 4, 'text-anchor': 'end', class: 'muted' }, `${v}°`));
+      }
+
+      // Time labels along the top (every 3 hours, or every 6 when space is tight), condition icons every 3 hours below them.
+      const labelEvery = step * 3 < 56 ? 6 : 3;
+      for (let i = 0; i < n; i += 3) {
+        svg.append(svgEl('text', { x: x(i), y: timeH + iconsH - 4, 'text-anchor': 'middle', 'font-size': 18 },
+          weatherAt(h.weather_code[i], h.is_day[i])[0]));
+        if (i % labelEvery === 0)
+          svg.append(svgEl('text', { x: x(i), y: 12, 'text-anchor': 'middle', class: 'muted' }, axisLabel(h.time[i])));
+      }
+
+      // Temperature area wash + 2px line.
+      const pts = temps.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`);
+      svg.append(svgEl('path', { d: `M${x(0)},${plotTop + plotH}L${pts.join('L')}L${x(n - 1)},${plotTop + plotH}Z`, fill: '#fff', 'fill-opacity': .1 }));
+      svg.append(svgEl('path', { d: `M${pts.join('L')}`, fill: 'none', stroke: '#fff', 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
+
+      // Direct labels only on the high and low.
+      const iMax = temps.indexOf(max), iMin = temps.indexOf(min);
+      for (const [i, above] of iMax === iMin ? [[iMax, true]] : [[iMax, true], [iMin, false]]) {
+        const lx = Math.min(Math.max(x(i), padL + 12), W - padR - 12);
+        svg.append(svgEl('circle', { cx: x(i), cy: y(temps[i]), r: 4, fill: '#fff', stroke: SURFACE, 'stroke-width': 2 }));
+        svg.append(svgEl('text', { x: lx, y: y(temps[i]) + (above ? -10 : 18), 'text-anchor': 'middle', 'font-weight': 700, 'font-size': 13 },
+          `${Math.round(temps[i])}°`));
+      }
+
+      // Chance-of-rain panel: fixed 0–100% scale, columns capped at 24px with 4px rounded tops.
+      svg.append(svgEl('text', { x: padL, y: rainTop - 12, class: 'muted' }, 'Chance of rain'));
+      svg.append(svgEl('line', { x1: padL, x2: W - padR, y1: rainTop, y2: rainTop, stroke: '#fff', 'stroke-opacity': .15 }));
+      svg.append(svgEl('line', { x1: padL, x2: W - padR, y1: rainBottom, y2: rainBottom, stroke: '#fff', 'stroke-opacity': .3 }));
+      svg.append(svgEl('text', { x: padL - 6, y: rainTop + 4, 'text-anchor': 'end', class: 'muted' }, '100%'));
+      svg.append(svgEl('text', { x: padL - 6, y: rainBottom, 'text-anchor': 'end', class: 'muted' }, '0'));
+      const bw = Math.min(24, step - 2);
+      rain.forEach((p, i) => {
+        const bh = (p / 100) * rainH;
+        if (bh < 1) return;
+        const r = Math.min(4, bh, bw / 2), bx = x(i) - bw / 2;
+        svg.append(svgEl('path', { fill: RAIN, d: `M${bx},${rainBottom}V${rainBottom - bh + r}Q${bx},${rainBottom - bh} ${bx + r},${rainBottom - bh}` +
+          `H${bx + bw - r}Q${bx + bw},${rainBottom - bh} ${bx + bw},${rainBottom - bh + r}V${rainBottom}Z` }));
+      });
+      const rMax = Math.max(...rain);
+      if (rMax >= 10) {
+        const i = rain.indexOf(rMax);
+        svg.append(svgEl('text', { x: Math.min(Math.max(x(i), padL + 14), W - padR - 14), y: rainBottom - (rMax / 100) * rainH - 4,
+          'text-anchor': 'middle', 'font-weight': 700, 'font-size': 12 }, `${rMax}%`));
+      }
+
+      // Hover/keyboard layer: crosshair snaps to the nearest hour; tooltip shows every value for that hour.
+      const cross = svgEl('line', { y1: plotTop - 8, y2: rainBottom, stroke: '#fff', 'stroke-opacity': .6, visibility: 'hidden' });
+      const dot = svgEl('circle', { r: 4, fill: '#fff', stroke: SURFACE, 'stroke-width': 2, visibility: 'hidden' });
+      svg.append(cross, dot);
+      const tip = $('hourly-tip');
+      let active = -1;
+      const show = i => {
+        active = i = Math.min(Math.max(i, 0), n - 1);
+        cross.setAttribute('x1', x(i)); cross.setAttribute('x2', x(i));
+        dot.setAttribute('cx', x(i)); dot.setAttribute('cy', y(temps[i]));
+        cross.setAttribute('visibility', 'visible'); dot.setAttribute('visibility', 'visible');
+        const [icon, desc] = weatherAt(h.weather_code[i], h.is_day[i]);
+        const strong = document.createElement('strong');
+        strong.textContent = `${Math.round(temps[i])}°${unit}`;
+        const lines = [`${icon} ${desc}`, `💧 ${rain[i]}% chance of rain`].map(text => {
+          const d = document.createElement('div'); d.textContent = text; return d;
+        });
+        const when = document.createElement('div');
+        when.className = 'sub';
+        when.textContent = `${weekday(h.time[i])} ${hourText(h.time[i])}`;
+        tip.replaceChildren(strong, ...lines, when);
+        tip.hidden = false;
+        const left = box.offsetLeft + x(i) + 12;
+        const flipped = left + tip.offsetWidth > box.offsetLeft + W ? left - tip.offsetWidth - 24 : left;
+        tip.style.left = `${Math.max(0, flipped)}px`;
+        tip.style.top = `${box.offsetTop + plotTop}px`;
+      };
+      const hide = () => { active = -1; tip.hidden = true; cross.setAttribute('visibility', 'hidden'); dot.setAttribute('visibility', 'hidden'); };
+      const hit = svgEl('rect', { x: 0, y: 0, width: W, height: H, fill: 'transparent' });
+      hit.addEventListener('pointermove', e => show(Math.floor((e.clientX - svg.getBoundingClientRect().left - padL) / step)));
+      hit.addEventListener('pointerleave', hide);
+      svg.append(hit);
+      svg.addEventListener('focus', () => show(0));
+      svg.addEventListener('blur', hide);
+      svg.addEventListener('keydown', e => {
+        if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') { e.preventDefault(); show(active + (e.key === 'ArrowRight' ? 1 : -1)); }
+        if (e.key === 'Escape') hide();
+      });
+      tip.hidden = true;
+      box.replaceChildren(svg);
+
+      // Table view: every value, readable without hovering.
+      $('hourly-rows').innerHTML = h.time.map((t, i) => {
+        const [icon, desc] = weatherAt(h.weather_code[i], h.is_day[i]);
+        return `<tr><td>${weekday(t)} ${hourText(t)}</td><td>${icon} ${desc}</td><td>${Math.round(temps[i])}°${unit}</td><td>${rain[i]}%</td></tr>`;
+      }).join('');
+    }
+
+    // The chart is drawn at the container's pixel width, so redraw it when the window resizes.
+    let resizeFrame = 0;
+    window.addEventListener('resize', () => {
+      cancelAnimationFrame(resizeFrame);
+      resizeFrame = requestAnimationFrame(() => lastData && renderHourly(lastData.hourly));
+    });
 
     function renderForecast(d) {
       const min = Math.min(...d.temperature_2m_min), max = Math.max(...d.temperature_2m_max);
